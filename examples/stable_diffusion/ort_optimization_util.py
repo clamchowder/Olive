@@ -10,10 +10,13 @@ from typing import Dict
 
 import onnxruntime as ort
 from diffusers import OnnxRuntimeModel, OnnxStableDiffusionPipeline
+from diffusers.schedulers import LMSDiscreteScheduler
 from onnxruntime import __version__ as OrtVersion
 from packaging import version
-
+from transformers import CLIPTokenizer, CLIPImageProcessor
 from olive.model import ONNXModelHandler
+
+import pdb;
 
 # ruff: noqa: TID252, T201
 
@@ -127,7 +130,7 @@ def save_onnx_pipeline(
 def get_ort_pipeline(model_dir, common_args, ort_args, guidance_scale):
     ort.set_default_logger_severity(3)
 
-    print("Loading models into ORT session...")
+    print("Loading models into ORT session...with device Id set")
     sess_options = ort.SessionOptions()
     sess_options.enable_mem_pattern = False
 
@@ -149,11 +152,45 @@ def get_ort_pipeline(model_dir, common_args, ort_args, guidance_scale):
         sess_options.add_free_dimension_override_by_name("unet_hidden_batch", hidden_batch_size)
         sess_options.add_free_dimension_override_by_name("unet_hidden_sequence", 77)
 
+    # directly load model
     provider_map = {
         "dml": "DmlExecutionProvider",
         "cuda": "CUDAExecutionProvider",
     }
-    assert provider in provider_map, f"Unsupported provider: {provider}"
-    return OnnxStableDiffusionPipeline.from_pretrained(
-        model_dir, provider=provider_map[provider], sess_options=sess_options
+
+    print("Creating inference session with model dir " + str(model_dir) + " and provider " + provider)
+    print("Test joinpath: " + ort.GetProviders())
+    vae_encoder_model_ort = ort.InferenceSession(model_dir.joinpath("vae_encoder\\model.onnx"), providers=[provider_map[provider]], sess_options=sess_options)
+    vae_encoder_model = OnnxRuntimeModel(model=vae_encoder_model_ort)
+    vae_decoder_model_ort = ort.InferenceSession(model_dir.joinpath("vae_decoder\\model.onnx"), providers=[provider_map[provider]], sess_options=sess_options)
+    vae_decoder_model = OnnxRuntimeModel(model=vae_decoder_model_ort)
+    text_encoder_model_ort = ort.InferenceSession(model_dir.joinpath("text_encoder\\model.onnx"), providers=[provider_map[provider]], sess_options=sess_options)
+    text_encoder_model = OnnxRuntimeModel(model=text_encoder_model_ort)
+    unet_model_ort = ort.InferenceSession(model_dir.joinpath("unet\\model.onnx"), providers=[provider_map[provider]], sess_options=sess_options)
+    # unet_model_ort.set_providers(['DmlExecutionProvider'], [{'device_id': 2}]) # only works with valid display adapter
+    unet_model_ort.set_providers(['DmlExecutionProvider'], [{'device_filter': 'npu'}])
+    unet_model = OnnxRuntimeModel(model=unet_model_ort)
+    #safety_checker_ort = ort.InferenceSession(model_dir.joinpath("safety_checker\\model.onnx"), providers=[provider_map[provider]], sess_options=sess_options)
+    #safety_checker = OnnxRuntimeModel(model=safety_checker_ort)
+    tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
+    feature_extractor = CLIPImageProcessor.from_pretrained("laion/CLIP-ViT-B-32-laion2B-s34B-b79K")
+    lms = LMSDiscreteScheduler(
+        beta_start=0.00085, 
+        beta_end=0.012, 
+        beta_schedule="scaled_linear"
     )
+
+    return OnnxStableDiffusionPipeline(
+        vae_encoder=vae_encoder_model, 
+        vae_decoder=vae_decoder_model, 
+        text_encoder=text_encoder_model, 
+        unet=unet_model, 
+        safety_checker=None, 
+        tokenizer=tokenizer,
+        scheduler=lms,
+        feature_extractor=feature_extractor)
+
+    #assert provider in provider_map, f"Unsupported provider: {provider}"
+    #return OnnxStableDiffusionPipeline.from_pretrained(
+    #    model_dir, provider=provider_map[provider], sess_options=sess_options
+    #)
